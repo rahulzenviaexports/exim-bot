@@ -614,3 +614,380 @@ if __name__ == "__main__":
     
     # Run the web server
     app.run(debug=False, port=5000, host='0.0.0.1')
+# ... existing code ...
+STATE = {
+    "running": False,
+    "last_check": "Never"
+}
+LOGS = []
+SEEN_LEADS = set()
+
+# --- MOCK BUYER DATABASE ---
+# In a production environment, this would connect to an API like Apollo.io or a custom PostgreSQL database.
+MOCK_BUYERS_DB = [
+    {"name": "Global Spice Co.", "country": "USA", "interest": ["TURMERIC", "SPICES"], "email": "procurement@globalspice.com", "phone": "+1-555-0192", "verified": True},
+    {"name": "Desert Traders LLC", "country": "UAE", "interest": ["MAKHANA", "FOX NUT", "DRY FRUITS"], "email": "purchasing@deserttraders.ae", "phone": "+971-50-1234567", "verified": True},
+    {"name": "EuroAgri Imports", "country": "Germany", "interest": ["RICE", "WHEAT", "GRAINS"], "email": "import@euroagri.de", "phone": "+49-30-123456", "verified": False},
+    {"name": "London Asian Foods", "country": "UK", "interest": ["MAKHANA", "TURMERIC", "INDIAN GROCERIES"], "email": "buyer@londonasian.co.uk", "phone": "+44-20-7946", "verified": True},
+    {"name": "Saudi Agro Corp", "country": "Saudi Arabia", "interest": ["RICE", "SPICES"], "email": "info@saudiagro.sa", "phone": "+966-11-456789", "verified": True},
+    {"name": "Sydney Organics", "country": "Australia", "interest": ["TURMERIC", "HONEY", "ORGANIC"], "email": "sourcing@sydneyorganics.com.au", "phone": "+61-2-1234", "verified": False},
+    {"name": "Nippon Traders", "country": "Japan", "interest": ["SESAME", "SPICES"], "email": "import@nippontraders.jp", "phone": "+81-3-1234", "verified": True},
+]
+
+def load_data():
+# ... existing code ...
+        else:
+            time.sleep(2) # Idle state
+
+# Start the background thread immediately
+thread = threading.Thread(target=background_scraper_loop, daemon=True)
+thread.start()
+
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EXIM Lead Discovery Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .log-container::-webkit-scrollbar { width: 8px; }
+        .log-container::-webkit-scrollbar-track { background: #1e293b; }
+        .log-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        
+        .tab-btn { transition: all 0.2s ease-in-out; }
+        .tab-active { background-color: #3b82f6; color: white; border-color: #3b82f6; }
+        .tab-inactive { background-color: transparent; color: #94a3b8; border-color: #334155; }
+        .tab-inactive:hover { background-color: #334155; color: #cbd5e1; }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-200 min-h-screen flex flex-col">
+    
+    <!-- Top Navbar -->
+    <nav class="bg-slate-800 border-b border-slate-700 p-4 sticky top-0 z-10">
+        <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
+            <div class="flex items-center space-x-3">
+                <div class="bg-blue-500/20 p-2 rounded-lg text-blue-400">
+                    <i class="fa-solid fa-ship text-xl"></i>
+                </div>
+                <h1 class="text-xl font-bold text-white tracking-tight">EXIM Lead Notifier</h1>
+            </div>
+            
+            <!-- Tabs -->
+            <div class="flex space-x-2 bg-slate-900/50 p-1 rounded-lg border border-slate-700">
+                <button onclick="switchTab('live')" id="btn-tab-live" class="tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2">
+                    <i class="fa-solid fa-satellite-dish"></i> <span>Live Scraper</span>
+                </button>
+                <button onclick="switchTab('directory')" id="btn-tab-directory" class="tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2">
+                    <i class="fa-solid fa-address-book"></i> <span>Buyer Directory</span>
+                </button>
+            </div>
+
+            <div class="flex items-center space-x-4 text-sm font-medium">
+                <span id="status-indicator" class="flex items-center space-x-2 bg-slate-700 px-3 py-1.5 rounded-full">
+                    <span class="w-2.5 h-2.5 rounded-full bg-slate-500" id="status-dot"></span>
+                    <span id="status-text">Stopped</span>
+                </span>
+            </div>
+        </div>
+    </nav>
+
+    <!-- MAIN VIEW: LIVE SCRAPER -->
+    <div id="view-live" class="max-w-7xl mx-auto p-4 lg:p-8 w-full grid grid-cols-1 lg:grid-cols-3 gap-8">
+        
+        <!-- Left Column: Controls & Config -->
+        <div class="space-y-6">
+            
+            <!-- Scraper Control Card -->
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-3 opacity-10">
+                    <i class="fa-solid fa-power-off text-6xl"></i>
+                </div>
+                <h2 class="text-lg font-semibold text-white mb-4">Engine Control</h2>
+                <div class="flex items-center space-x-4 mb-4">
+                    <button id="btn-start" onclick="toggleEngine('start')" class="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-play"></i> <span>Start Bot</span>
+                    </button>
+                    <button id="btn-stop" onclick="toggleEngine('stop')" class="flex-1 bg-rose-500 hover:bg-rose-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-rose-500/20 opacity-50 cursor-not-allowed flex items-center justify-center space-x-2" disabled>
+                        <i class="fa-solid fa-stop"></i> <span>Stop Bot</span>
+                    </button>
+                </div>
+                <p class="text-sm text-slate-400">Last Checked: <span id="last-checked" class="text-slate-300 font-medium">Never</span></p>
+            </div>
+
+            <!-- Telegram Config Card -->
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl">
+                <h2 class="text-lg font-semibold text-white mb-4 flex items-center space-x-2">
+                    <i class="fa-brands fa-telegram text-blue-400"></i>
+                    <span>Telegram Alerts</span>
+                </h2>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Bot Token</label>
+                        <input type="password" id="tg-token" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Chat ID</label>
+                        <input type="text" id="tg-chat-id" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="-100123456789">
+                    </div>
+                    <button onclick="saveConfig()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg text-sm font-medium transition-colors">
+                        Save Configuration
+                    </button>
+                </div>
+            </div>
+
+            <!-- Live Logs Card -->
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl flex flex-col h-[350px]">
+                <h2 class="text-lg font-semibold text-white mb-4 flex items-center justify-between">
+                    <span><i class="fa-solid fa-terminal mr-2 text-slate-400"></i> System Logs</span>
+                    <button onclick="clearLogs()" class="text-xs text-slate-500 hover:text-slate-300"><i class="fa-solid fa-trash"></i></button>
+                </h2>
+                <div id="logs-container" class="flex-1 bg-slate-900 rounded-xl p-4 overflow-y-auto log-container font-mono text-xs space-y-2 border border-slate-700/50">
+                    <!-- Logs will be injected here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column: Product Management -->
+        <div class="lg:col-span-2 space-y-6">
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl shadow-xl overflow-hidden flex flex-col h-full">
+                
+                <!-- Add Product Header Form -->
+                <div class="p-6 border-b border-slate-700 bg-slate-800/50">
+                    <h2 class="text-lg font-semibold text-white mb-4">Targeted Products</h2>
+                    <form id="add-product-form" onsubmit="addProduct(event)" class="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+                        <div class="md:col-span-4">
+                            <label class="block text-xs font-medium text-slate-400 mb-1">Product Name *</label>
+                            <input type="text" id="prod-name" required class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. Makhana, Turmeric">
+                        </div>
+                        <div class="md:col-span-3">
+                            <label class="block text-xs font-medium text-slate-400 mb-1">HS Code (Optional)</label>
+                            <input type="text" id="prod-hs" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. 19041090">
+                        </div>
+                        <div class="md:col-span-3">
+                            <label class="block text-xs font-medium text-slate-400 mb-1">Countries (Comma sep.)</label>
+                            <input type="text" id="prod-countries" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. USA, UAE, UK">
+                        </div>
+                        <div class="md:col-span-2">
+                            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-sm font-medium transition-colors h-[38px]">
+                                Add Target
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Products Table -->
+                <div class="flex-1 overflow-auto bg-slate-900/50">
+                    <table class="w-full text-left text-sm text-slate-300">
+                        <thead class="text-xs uppercase bg-slate-800/80 text-slate-400 sticky top-0">
+                            <tr>
+                                <th class="px-6 py-4 font-medium">Product Name</th>
+                                <th class="px-6 py-4 font-medium">HS Code</th>
+                                <th class="px-6 py-4 font-medium">Target Markets</th>
+                                <th class="px-6 py-4 font-medium text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="products-table-body" class="divide-y divide-slate-700/50">
+                            <!-- Rows injected via JS -->
+                        </tbody>
+                    </table>
+                    
+                    <!-- Empty State -->
+                    <div id="empty-state" class="hidden flex flex-col items-center justify-center p-12 text-slate-500">
+                        <i class="fa-solid fa-box-open text-4xl mb-3 opacity-50"></i>
+                        <p>No products targeted yet.</p>
+                        <p class="text-xs mt-1">Add a product above to start monitoring EXIM leads.</p>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+    </div>
+
+    <!-- MAIN VIEW: BUYER DIRECTORY (Hidden by default) -->
+    <div id="view-directory" class="max-w-7xl mx-auto p-4 lg:p-8 w-full hidden flex-col flex-1">
+        <div class="flex justify-between items-end mb-6">
+            <div>
+                <h2 class="text-2xl font-bold text-white mb-1">Global Buyer Database</h2>
+                <p class="text-slate-400 text-sm">Discover existing international buyers matching your targeted products.</p>
+            </div>
+            <button onclick="fetchDirectory()" class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center space-x-2">
+                <i class="fa-solid fa-rotate-right"></i> <span>Refresh Matches</span>
+            </button>
+        </div>
+
+        <div id="directory-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <!-- Directory Cards Injected Here -->
+        </div>
+        
+        <div id="directory-empty" class="hidden flex flex-col items-center justify-center p-20 bg-slate-800/50 border border-slate-700 rounded-2xl text-slate-500 mt-6">
+            <i class="fa-solid fa-magnifying-glass text-5xl mb-4 opacity-50"></i>
+            <h3 class="text-xl font-medium text-slate-300">No matching buyers found</h3>
+            <p class="mt-2 text-center max-w-md text-sm">We couldn't find any existing buyers in the database for your specific products. Try adding more general targets like "Spices" or "Rice".</p>
+        </div>
+    </div>
+
+    <script>
+        // --- TAB SWITCHING LOGIC ---
+        function switchTab(tabId) {
+            const btnLive = document.getElementById('btn-tab-live');
+            const btnDir = document.getElementById('btn-tab-directory');
+            const viewLive = document.getElementById('view-live');
+            const viewDir = document.getElementById('view-directory');
+
+            if(tabId === 'live') {
+                btnLive.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border';
+                btnDir.className = 'tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-transparent';
+                viewLive.classList.remove('hidden');
+                viewLive.classList.add('grid');
+                viewDir.classList.add('hidden');
+                viewDir.classList.remove('flex');
+            } else {
+                btnDir.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border';
+                btnLive.className = 'tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-transparent';
+                viewDir.classList.remove('hidden');
+                viewDir.classList.add('flex');
+                viewLive.classList.add('hidden');
+                viewLive.classList.remove('grid');
+                fetchDirectory(); // Load data when opening tab
+            }
+        }
+
+        // --- DIRECTORY LOGIC ---
+        async function fetchDirectory() {
+            try {
+                const res = await fetch('/api/directory');
+                const buyers = await res.json();
+                renderDirectory(buyers);
+            } catch (e) {
+                console.error("Failed to fetch directory", e);
+            }
+        }
+
+        function renderDirectory(buyers) {
+            const grid = document.getElementById('directory-grid');
+            const emptyState = document.getElementById('directory-empty');
+            
+            grid.innerHTML = '';
+            
+            if (buyers.length === 0) {
+                emptyState.classList.remove('hidden');
+                grid.classList.add('hidden');
+                return;
+            }
+            
+            emptyState.classList.add('hidden');
+            grid.classList.remove('hidden');
+            
+            buyers.forEach(buyer => {
+                const tags = buyer.interest.map(i => `<span class="bg-blue-900/30 text-blue-400 border border-blue-800/50 px-2 py-0.5 rounded text-xs">${i}</span>`).join('');
+                const badge = buyer.verified 
+                    ? `<span class="flex items-center space-x-1 text-emerald-400 text-xs bg-emerald-400/10 px-2 py-1 rounded-full"><i class="fa-solid fa-circle-check"></i> <span>Verified</span></span>` 
+                    : `<span class="flex items-center space-x-1 text-amber-400 text-xs bg-amber-400/10 px-2 py-1 rounded-full"><i class="fa-solid fa-circle-question"></i> <span>Unverified</span></span>`;
+                
+                const card = document.createElement('div');
+                card.className = "bg-slate-800 border border-slate-700 p-5 rounded-xl shadow-lg hover:border-slate-600 transition-colors flex flex-col";
+                card.innerHTML = `
+                    <div class="flex justify-between items-start mb-4">
+                        <div>
+                            <h3 class="font-bold text-white text-lg">${buyer.name}</h3>
+                            <div class="text-sm text-slate-400 flex items-center space-x-1 mt-1">
+                                <i class="fa-solid fa-location-dot"></i> <span>${buyer.country}</span>
+                            </div>
+                        </div>
+                        ${badge}
+                    </div>
+                    <div class="mb-4 flex-1">
+                        <p class="text-xs text-slate-500 mb-2 uppercase tracking-wide font-semibold">Interested In:</p>
+                        <div class="flex flex-wrap gap-2">
+                            ${tags}
+                        </div>
+                    </div>
+                    <div class="pt-4 border-t border-slate-700 space-y-2">
+                        <a href="mailto:${buyer.email}" class="flex items-center space-x-2 text-sm text-slate-300 hover:text-white transition-colors group">
+                            <div class="w-8 h-8 rounded bg-slate-700 flex items-center justify-center group-hover:bg-blue-600 transition-colors">
+                                <i class="fa-solid fa-envelope"></i>
+                            </div>
+                            <span>${buyer.email}</span>
+                        </a>
+                        <div class="flex items-center space-x-2 text-sm text-slate-300 group">
+                            <div class="w-8 h-8 rounded bg-slate-700 flex items-center justify-center">
+                                <i class="fa-solid fa-phone"></i>
+                            </div>
+                            <span>${buyer.phone}</span>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+
+        // Fetch Initial State
+        async function fetchState() {
+# ... existing code ...
+        // Initialization & Polling
+        fetchState();
+        fetchLogs();
+        
+        // Poll status and logs every 2 seconds
+        setInterval(async () => {
+            fetchLogs();
+            const res = await fetch('/api/state');
+            const data = await res.json();
+            updateStatusUI(data.running, data.last_check);
+        }, 2000);
+
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+# ... existing code ...
+@app.route("/api/logs", methods=["DELETE"])
+def delete_logs():
+    LOGS.clear()
+    add_log("Logs cleared.")
+    return jsonify({"status": "ok"})
+
+@app.route("/api/directory", methods=["GET"])
+def get_directory():
+    """Matches configured target products with the mock buyer database."""
+    config = load_data()
+    target_products = [p["name"].upper() for p in config.get("products", [])]
+    
+    # If no targets are set, don't show any buyers
+    if not target_products:
+        return jsonify([])
+        
+    matched_buyers = []
+    
+    for buyer in MOCK_BUYERS_DB:
+        # Check if any of the buyer's interests align with our targeted products
+        # A simple keyword match: if our target word is in their interest list
+        buyer_interests = [i.upper() for i in buyer["interest"]]
+        
+        is_match = False
+        for target in target_products:
+            for interest in buyer_interests:
+                if target in interest or interest in target:
+                    is_match = True
+                    break
+            if is_match:
+                break
+                
+        if is_match:
+            matched_buyers.append(buyer)
+            
+    return jsonify(matched_buyers)
+
+
+if __name__ == "__main__":
+    # Ensure config file exists initially
+# ... existing code ...
