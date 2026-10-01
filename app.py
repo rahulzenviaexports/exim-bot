@@ -4,12 +4,11 @@ import json
 import threading
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# --- GLOBAL STATE & PERSISTENCE ---
-DATA_FILE = "exim_config.json"
+CONFIG_FILE = "exim_config.json"
 STATE = {
     "running": False,
     "last_check": "Never"
@@ -17,41 +16,46 @@ STATE = {
 LOGS = []
 SEEN_LEADS = set()
 
+MOCK_BUYERS_DB = [
+    {"name": "Global Spice Co.", "country": "USA", "interest": ["TURMERIC", "SPICES"], "email": "procurement@globalspice.com", "phone": "+1-555-0192", "verified": True},
+    {"name": "Desert Traders LLC", "country": "UAE", "interest": ["MAKHANA", "FOX NUT", "DRY FRUITS"], "email": "purchasing@deserttraders.ae", "phone": "+971-50-1234567", "verified": True},
+    {"name": "EuroAgri Imports", "country": "Germany", "interest": ["RICE", "WHEAT", "GRAINS"], "email": "import@euroagri.de", "phone": "+49-30-123456", "verified": False},
+    {"name": "London Asian Foods", "country": "UK", "interest": ["MAKHANA", "TURMERIC", "INDIAN GROCERIES"], "email": "buyer@londonasian.co.uk", "phone": "+44-20-7946", "verified": True},
+    {"name": "Saudi Agro Corp", "country": "Saudi Arabia", "interest": ["RICE", "SPICES"], "email": "info@saudiagro.sa", "phone": "+966-11-456789", "verified": True},
+    {"name": "Sydney Organics", "country": "Australia", "interest": ["TURMERIC", "HONEY", "ORGANIC"], "email": "sourcing@sydneyorganics.com.au", "phone": "+61-2-1234", "verified": False},
+    {"name": "Nippon Traders", "country": "Japan", "interest": ["SESAME", "SPICES"], "email": "import@nippontraders.jp", "phone": "+81-3-1234", "verified": True},
+]
+
 def load_data():
-    """Loads configuration and target products from a JSON file."""
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {
-        "telegram_token": "8985436294:AAFmTeHQM2PKVAgKjI_VY--4UJYrndoiBZw",
-        "telegram_chat_id": "2132933443",
-        "products": []
-    }
+    if not os.path.exists(CONFIG_FILE):
+        default_config = {"tg_token": "", "tg_chat_id": "", "products": []}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(default_config, f)
+        return default_config
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"tg_token": "", "tg_chat_id": "", "products": []}
 
 def save_data(data):
-    """Saves configuration and target products to a JSON file."""
-    with open(DATA_FILE, "w") as f:
+    with open(CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-def add_log(message, type="info"):
-    """Adds a timestamped log to the in-memory log queue."""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = {"time": timestamp, "message": message, "type": type}
-    LOGS.append(log_entry)
-    print(f"[{timestamp}] {message}")
-    if len(LOGS) > 100:  # Keep only the last 100 logs to save memory
+def add_log(msg):
+    timestamp = time.strftime("%H:%M:%S")
+    formatted_msg = f"[{timestamp}] {msg}"
+    LOGS.append(formatted_msg)
+    if len(LOGS) > 50:
         LOGS.pop(0)
+    print(formatted_msg)
 
 def send_telegram_alert(lead, matched_keyword, config):
-    """Formats and sends the lead alert to Telegram."""
-    token = config.get("telegram_token")
-    chat_id = config.get("telegram_chat_id")
+    token = config.get("tg_token")
+    chat_id = config.get("tg_chat_id")
     
     if not token or not chat_id:
-        add_log("Telegram alert skipped: Token or Chat ID not configured.", "error")
+        add_log("Telegram alert skipped: Token or Chat ID not configured.")
         return
 
     message = (
@@ -74,61 +78,56 @@ def send_telegram_alert(lead, matched_keyword, config):
     }
     
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        add_log(f"Alert sent to Telegram for {lead['product']} ({lead['country']})", "success")
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            add_log(f"Telegram alert sent for {lead['product']} ({lead['country']})")
+        else:
+            add_log(f"Telegram API Error: {response.text}")
     except Exception as e:
-        add_log(f"Failed to send Telegram alert: {e}", "error")
+        add_log(f"Failed to send Telegram alert: {e}")
 
-def is_lead_a_match(product_text, details_text, country_text, products_config):
-    """Evaluates if the scraped lead matches any of our target products and countries."""
+def is_lead_a_match(product_text, details_text, country_text, target_products):
     product_upper = product_text.upper()
     details_upper = details_text.upper()
     country_upper = country_text.upper()
 
-    for p in products_config:
-        # Check if Name or HS code is in the product title or description
+    for p in target_products:
         name_match = p["name"].upper() in product_upper or p["name"].upper() in details_upper
         hs_match = False
         if p.get("hs_code"):
-            hs_code_str = str(p["hs_code"]).strip()
+            hs_code_str = str(p["hs_code"])
             hs_match = hs_code_str in product_upper or hs_code_str in details_upper
         
         if name_match or hs_match:
-            # If the product matches, check if the country matches (or if all countries targeted)
-            target_countries = [c.upper().strip() for c in p.get("countries", []) if c.strip()]
-            if not target_countries or country_upper in target_countries:
-                return p["name"] # Return the name of the matched product target
+            countries = p.get("countries", [])
+            if not countries or len(countries) == 0:
+                return p["name"]
+            
+            target_countries_upper = [c.strip().upper() for c in countries]
+            if country_upper in target_countries_upper:
+                return p["name"]
                 
     return False
 
-def scrape_apeda_leads():
-    """Scrapes buyer inquiries from APEDA AgriExchange."""
+def scrape_apeda_leads(config):
     url = "https://agriexchange.apeda.gov.in/Buyer/MyBuyOffers"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
-    data = load_data()
-    if not data["products"]:
-        add_log("No target products configured. Skipping scrape.", "warning")
-        return
-
-    add_log(f"Checking APEDA for new leads... (Monitoring {len(data['products'])} targets)")
-    STATE["last_check"] = time.strftime("%I:%M %p")
+    target_products = config.get("products", [])
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(response.content, "html.parser")
-        
         rows = soup.find_all("tr")
-        leads_found = 0
+        
+        leads_processed = 0
         matches_found = 0
         
         for row in rows:
             cols = row.find_all("td")
             if len(cols) >= 5:
-                leads_found += 1
+                leads_processed += 1
                 product = cols[0].text.strip()
                 buyer_name = cols[2].text.strip()
                 country = cols[3].text.strip()
@@ -138,7 +137,7 @@ def scrape_apeda_leads():
                 if lead_id in SEEN_LEADS:
                     continue
                 
-                matched_target = is_lead_a_match(product, details, country, data["products"])
+                matched_target = is_lead_a_match(product, details, country, target_products)
                 
                 if matched_target:
                     matches_found += 1
@@ -151,27 +150,40 @@ def scrape_apeda_leads():
                         "link": url
                     }
                     
-                    send_telegram_alert(lead_data, matched_keyword=matched_target, config=data)
+                    add_log(f"MATCH FOUND: {matched_target} -> {product} ({country})")
+                    send_telegram_alert(lead_data, matched_target, config)
                     SEEN_LEADS.add(lead_id)
-        
-        add_log(f"Scrape complete: {leads_found} leads parsed, {matches_found} new matches found.")
 
+        add_log(f"Scraped {leads_processed} leads. Found {matches_found} new matches.")
     except Exception as e:
-        add_log(f"Error scraping portal: {e}", "error")
+        add_log(f"Error scraping portal: {str(e)}")
 
 def background_scraper_loop():
-    """Runs the scraper continuously in the background when active."""
+    add_log("Background engine initialized. Waiting for START signal.")
     while True:
         if STATE["running"]:
-            scrape_apeda_leads()
+            config = load_data()
+            products = config.get("products", [])
             
-            # Wait 15 minutes (900 seconds) but check every second if we should stop
-            for _ in range(900):
+            if not products:
+                add_log("Engine running, but no products are targeted. Please add products.")
+                time.sleep(15)
+                continue
+                
+            add_log(f"Initiating scan for {len(products)} targeted product(s)...")
+            scrape_apeda_leads(config)
+            STATE["last_check"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            add_log("Scan complete. Sleeping for 15 minutes...")
+            
+            # Sleep in chunks so we can interrupt it if the user clicks Stop
+            for _ in range(15 * 60): 
                 if not STATE["running"]:
+                    add_log("Engine stopped by user during sleep cycle.")
                     break
                 time.sleep(1)
         else:
-            time.sleep(2) # Idle state
+            time.sleep(2) # Idle state checking every 2 seconds
 
 # Start the background thread immediately
 thread = threading.Thread(target=background_scraper_loop, daemon=True)
@@ -190,474 +202,9 @@ HTML_TEMPLATE = r"""
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
         .log-container::-webkit-scrollbar { width: 8px; }
-        .log-container::-webkit-scrollbar-track { background: #1e293b; }
+        .log-container::-webkit-scrollbar-track { background: #1e293b; border-radius: 4px; }
         .log-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-    </style>
-</head>
-<body class="bg-slate-900 text-slate-200 min-h-screen">
-    
-    <!-- Top Navbar -->
-    <nav class="bg-slate-800 border-b border-slate-700 p-4 sticky top-0 z-10">
-        <div class="max-w-7xl mx-auto flex justify-between items-center">
-            <div class="flex items-center space-x-3">
-                <div class="bg-blue-500/20 p-2 rounded-lg text-blue-400">
-                    <i class="fa-solid fa-ship text-xl"></i>
-                </div>
-                <h1 class="text-xl font-bold text-white tracking-tight">EXIM Lead Notifier</h1>
-            </div>
-            <div class="flex items-center space-x-4 text-sm font-medium">
-                <span id="status-indicator" class="flex items-center space-x-2 bg-slate-700 px-3 py-1.5 rounded-full">
-                    <span class="w-2.5 h-2.5 rounded-full bg-slate-500" id="status-dot"></span>
-                    <span id="status-text">Stopped</span>
-                </span>
-            </div>
-        </div>
-    </nav>
-
-    <div class="max-w-7xl mx-auto p-4 lg:p-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
-        <!-- Left Column: Controls & Config -->
-        <div class="space-y-6">
-            
-            <!-- Scraper Control Card -->
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-3 opacity-10">
-                    <i class="fa-solid fa-power-off text-6xl"></i>
-                </div>
-                <h2 class="text-lg font-semibold text-white mb-4">Engine Control</h2>
-                <div class="flex items-center space-x-4 mb-4">
-                    <button id="btn-start" onclick="toggleEngine('start')" class="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2">
-                        <i class="fa-solid fa-play"></i> <span>Start Bot</span>
-                    </button>
-                    <button id="btn-stop" onclick="toggleEngine('stop')" class="flex-1 bg-rose-500 hover:bg-rose-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-rose-500/20 opacity-50 cursor-not-allowed flex items-center justify-center space-x-2" disabled>
-                        <i class="fa-solid fa-stop"></i> <span>Stop Bot</span>
-                    </button>
-                </div>
-                <p class="text-sm text-slate-400">Last Checked: <span id="last-checked" class="text-slate-300 font-medium">Never</span></p>
-            </div>
-
-            <!-- Telegram Config Card -->
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl">
-                <h2 class="text-lg font-semibold text-white mb-4 flex items-center space-x-2">
-                    <i class="fa-brands fa-telegram text-blue-400"></i>
-                    <span>Telegram Alerts</span>
-                </h2>
-                <div class="space-y-4">
-                    <div>
-                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Bot Token</label>
-                        <input type="password" id="tg-token" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Chat ID</label>
-                        <input type="text" id="tg-chat-id" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="-100123456789">
-                    </div>
-                    <button onclick="saveConfig()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg text-sm font-medium transition-colors">
-                        Save Configuration
-                    </button>
-                </div>
-            </div>
-
-            <!-- Live Logs Card -->
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl flex flex-col h-[350px]">
-                <h2 class="text-lg font-semibold text-white mb-4 flex items-center justify-between">
-                    <span><i class="fa-solid fa-terminal mr-2 text-slate-400"></i> System Logs</span>
-                    <button onclick="clearLogs()" class="text-xs text-slate-500 hover:text-slate-300"><i class="fa-solid fa-trash"></i></button>
-                </h2>
-                <div id="logs-container" class="flex-1 bg-slate-900 rounded-xl p-4 overflow-y-auto log-container font-mono text-xs space-y-2 border border-slate-700/50">
-                    <!-- Logs will be injected here -->
-                </div>
-            </div>
-        </div>
-
-        <!-- Right Column: Product Management -->
-        <div class="lg:col-span-2 space-y-6">
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl shadow-xl overflow-hidden flex flex-col h-full">
-                
-                <!-- Add Product Header Form -->
-                <div class="p-6 border-b border-slate-700 bg-slate-800/50">
-                    <h2 class="text-lg font-semibold text-white mb-4">Targeted Products</h2>
-                    <form id="add-product-form" onsubmit="addProduct(event)" class="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
-                        <div class="md:col-span-4">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">Product Name *</label>
-                            <input type="text" id="prod-name" required class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. Makhana, Turmeric">
-                        </div>
-                        <div class="md:col-span-3">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">HS Code (Optional)</label>
-                            <input type="text" id="prod-hs" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. 19041090">
-                        </div>
-                        <div class="md:col-span-3">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">Countries (Comma sep.)</label>
-                            <input type="text" id="prod-countries" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. USA, UAE, UK">
-                        </div>
-                        <div class="md:col-span-2">
-                            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-sm font-medium transition-colors h-[38px]">
-                                Add Target
-                            </button>
-                        </div>
-                    </form>
-                </div>
-
-                <!-- Products Table -->
-                <div class="flex-1 overflow-auto bg-slate-900/50">
-                    <table class="w-full text-left text-sm text-slate-300">
-                        <thead class="text-xs uppercase bg-slate-800/80 text-slate-400 sticky top-0">
-                            <tr>
-                                <th class="px-6 py-4 font-medium">Product Name</th>
-                                <th class="px-6 py-4 font-medium">HS Code</th>
-                                <th class="px-6 py-4 font-medium">Target Markets</th>
-                                <th class="px-6 py-4 font-medium text-right">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="products-table-body" class="divide-y divide-slate-700/50">
-                            <!-- Rows injected via JS -->
-                        </tbody>
-                    </table>
-                    
-                    <!-- Empty State -->
-                    <div id="empty-state" class="hidden flex flex-col items-center justify-center p-12 text-slate-500">
-                        <i class="fa-solid fa-box-open text-4xl mb-3 opacity-50"></i>
-                        <p>No products targeted yet.</p>
-                        <p class="text-xs mt-1">Add a product above to start monitoring EXIM leads.</p>
-                    </div>
-                </div>
-
-            </div>
-        </div>
-
-    </div>
-
-    <script>
-        // Fetch Initial State
-        async function fetchState() {
-            try {
-                const res = await fetch('/api/state');
-                const data = await res.json();
-                
-                // Update Config
-                document.getElementById('tg-token').value = data.config.telegram_token;
-                document.getElementById('tg-chat-id').value = data.config.telegram_chat_id;
-                
-                // Update Products
-                renderProducts(data.config.products);
-                
-                // Update Status
-                updateStatusUI(data.running, data.last_check);
-            } catch (e) {
-                console.error("Failed to fetch state", e);
-            }
-        }
-
-        // Render Products Table
-        function renderProducts(products) {
-            const tbody = document.getElementById('products-table-body');
-            const emptyState = document.getElementById('empty-state');
-            
-            tbody.innerHTML = '';
-            
-            if (products.length === 0) {
-                emptyState.classList.remove('hidden');
-                return;
-            }
-            
-            emptyState.classList.add('hidden');
-            
-            products.forEach((p, index) => {
-                const countries = p.countries && p.countries.length > 0 
-                    ? p.countries.map(c => `<span class="px-2 py-1 bg-slate-700 rounded-md text-xs mr-1 mb-1 inline-block">${c}</span>`).join('') 
-                    : '<span class="px-2 py-1 bg-blue-900/50 text-blue-300 rounded-md text-xs">Global (All)</span>';
-                
-                const tr = document.createElement('tr');
-                tr.className = "hover:bg-slate-800/50 transition-colors group";
-                tr.innerHTML = `
-                    <td class="px-6 py-4 font-medium text-white">${p.name}</td>
-                    <td class="px-6 py-4 font-mono text-slate-400">${p.hs_code || '-'}</td>
-                    <td class="px-6 py-4 flex flex-wrap">${countries}</td>
-                    <td class="px-6 py-4 text-right">
-                        <button onclick="deleteProduct(${index})" class="text-slate-500 hover:text-rose-400 transition-colors p-2 rounded-lg hover:bg-rose-400/10 opacity-0 group-hover:opacity-100 focus:opacity-100">
-                            <i class="fa-solid fa-trash-can"></i>
-                        </button>
-                    </td>
-                `;
-                tbody.appendChild(tr);
-            });
-        }
-
-        // Add Product
-        async function addProduct(e) {
-            e.preventDefault();
-            const btn = e.target.querySelector('button[type="submit"]');
-            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
-            
-            const name = document.getElementById('prod-name').value.trim();
-            const hs_code = document.getElementById('prod-hs').value.trim();
-            const countriesStr = document.getElementById('prod-countries').value.trim();
-            
-            const countries = countriesStr ? countriesStr.split(',').map(c => c.trim()).filter(c => c) : [];
-            
-            try {
-                const res = await fetch('/api/products', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name, hs_code, countries})
-                });
-                if (res.ok) {
-                    document.getElementById('add-product-form').reset();
-                    fetchState();
-                }
-            } catch (err) {
-                alert("Failed to add product");
-            } finally {
-                btn.innerHTML = 'Add Target';
-            }
-        }
-
-        // Delete Product
-        async function deleteProduct(index) {
-            if(!confirm("Remove this target product?")) return;
-            try {
-                await fetch(`/api/products/${index}`, { method: 'DELETE' });
-                fetchState();
-            } catch(e) {
-                alert("Failed to delete.");
-            }
-        }
-
-        // Save Config
-        async function saveConfig() {
-            const token = document.getElementById('tg-token').value.trim();
-            const chatId = document.getElementById('tg-chat-id').value.trim();
-            
-            try {
-                await fetch('/api/config', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ telegram_token: token, telegram_chat_id: chatId })
-                });
-                alert("Configuration Saved!");
-            } catch(e) {
-                alert("Error saving configuration.");
-            }
-        }
-
-        // Engine Control UI Updates
-        function updateStatusUI(isRunning, lastCheck) {
-            const dot = document.getElementById('status-dot');
-            const text = document.getElementById('status-text');
-            const btnStart = document.getElementById('btn-start');
-            const btnStop = document.getElementById('btn-stop');
-            
-            document.getElementById('last-checked').innerText = lastCheck;
-
-            if (isRunning) {
-                dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse";
-                text.innerText = "Monitoring Active";
-                text.className = "text-emerald-400";
-                
-                btnStart.disabled = true;
-                btnStart.classList.add('opacity-50', 'cursor-not-allowed');
-                btnStop.disabled = false;
-                btnStop.classList.remove('opacity-50', 'cursor-not-allowed');
-            } else {
-                dot.className = "w-2.5 h-2.5 rounded-full bg-slate-500";
-                text.innerText = "Engine Stopped";
-                text.className = "text-slate-400";
-                
-                btnStart.disabled = false;
-                btnStart.classList.remove('opacity-50', 'cursor-not-allowed');
-                btnStop.disabled = true;
-                btnStop.classList.add('opacity-50', 'cursor-not-allowed');
-            }
-        }
-
-        // Toggle Engine
-        async function toggleEngine(action) {
-            try {
-                const res = await fetch('/api/engine', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ action: action })
-                });
-                const data = await res.json();
-                updateStatusUI(data.running, data.last_check);
-            } catch(e) {
-                console.error(e);
-            }
-        }
-
-        // Fetch and Render Logs
-        async function fetchLogs() {
-            try {
-                const res = await fetch('/api/logs');
-                const logs = await res.json();
-                const container = document.getElementById('logs-container');
-                
-                let isScrolledToBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 10;
-                
-                container.innerHTML = logs.map(log => {
-                    let color = 'text-slate-400';
-                    let icon = 'fa-info-circle';
-                    if (log.type === 'error') { color = 'text-rose-400'; icon = 'fa-triangle-exclamation'; }
-                    if (log.type === 'success') { color = 'text-emerald-400'; icon = 'fa-check'; }
-                    if (log.type === 'warning') { color = 'text-amber-400'; icon = 'fa-bolt'; }
-                    
-                    return `<div class="flex items-start space-x-2 border-b border-slate-800 pb-1">
-                                <span class="text-slate-500 shrink-0">[${log.time.split(' ')[1]}]</span>
-                                <i class="fa-solid ${icon} mt-[2px] ${color} text-[10px] shrink-0"></i>
-                                <span class="${color}">${log.message}</span>
-                            </div>`;
-                }).join('');
-                
-                if (isScrolledToBottom) {
-                    container.scrollTop = container.scrollHeight;
-                }
-            } catch(e) {}
-        }
-        
-        async function clearLogs() {
-            await fetch('/api/logs', { method: 'DELETE' });
-            fetchLogs();
-        }
-
-        // Initialization & Polling
-        fetchState();
-        fetchLogs();
-        
-        // Poll status and logs every 2 seconds
-        setInterval(async () => {
-            fetchLogs();
-            const res = await fetch('/api/state');
-            const data = await res.json();
-            updateStatusUI(data.running, data.last_check);
-        }, 2000);
-
-    </script>
-</body>
-</html>
-"""
-
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route("/api/state")
-def get_state():
-    return jsonify({
-        "config": load_data(),
-        "running": STATE["running"],
-        "last_check": STATE["last_check"]
-    })
-
-@app.route("/api/config", methods=["POST"])
-def update_config():
-    req_data = request.json
-    data = load_data()
-    data["telegram_token"] = req_data.get("telegram_token", data["telegram_token"])
-    data["telegram_chat_id"] = req_data.get("telegram_chat_id", data["telegram_chat_id"])
-    save_data(data)
-    add_log("Telegram configuration updated.", "success")
-    return jsonify({"status": "ok"})
-
-@app.route("/api/products", methods=["POST"])
-def add_product():
-    req_data = request.json
-    data = load_data()
-    new_product = {
-        "name": req_data.get("name", "").strip(),
-        "hs_code": req_data.get("hs_code", "").strip(),
-        "countries": req_data.get("countries", [])
-    }
-    data["products"].append(new_product)
-    save_data(data)
-    add_log(f"Target added: {new_product['name']}", "success")
-    return jsonify({"status": "ok"})
-
-@app.route("/api/products/<int:index>", methods=["DELETE"])
-def delete_product(index):
-    data = load_data()
-    if 0 <= index < len(data["products"]):
-        removed = data["products"].pop(index)
-        save_data(data)
-        add_log(f"Target removed: {removed['name']}", "warning")
-    return jsonify({"status": "ok"})
-
-@app.route("/api/engine", methods=["POST"])
-def toggle_engine():
-    action = request.json.get("action")
-    if action == "start":
-        STATE["running"] = True
-        add_log("Scraping engine STARTED.", "success")
-    elif action == "stop":
-        STATE["running"] = False
-        add_log("Scraping engine STOPPED.", "warning")
-    return jsonify({"running": STATE["running"], "last_check": STATE["last_check"]})
-
-@app.route("/api/logs", methods=["GET"])
-def get_logs():
-    return jsonify(LOGS)
-
-@app.route("/api/logs", methods=["DELETE"])
-def delete_logs():
-    LOGS.clear()
-    add_log("Logs cleared.")
-    return jsonify({"status": "ok"})
-
-if __name__ == "__main__":
-    # Ensure config file exists initially
-    if not os.path.exists(DATA_FILE):
-        save_data({"telegram_token": "", "telegram_chat_id": "", "products": []})
-        
-    add_log("Dashboard starting... Accessible at http://127.0.0.1:5000")
-    # Turn off default Flask request logging for cleaner terminal output
-    import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
-    
-    # Run the web server
-    app.run(debug=False, port=5000, host='0.0.0.1')
-# ... existing code ...
-STATE = {
-    "running": False,
-    "last_check": "Never"
-}
-LOGS = []
-SEEN_LEADS = set()
-
-# --- MOCK BUYER DATABASE ---
-# In a production environment, this would connect to an API like Apollo.io or a custom PostgreSQL database.
-MOCK_BUYERS_DB = [
-    {"name": "Global Spice Co.", "country": "USA", "interest": ["TURMERIC", "SPICES"], "email": "procurement@globalspice.com", "phone": "+1-555-0192", "verified": True},
-    {"name": "Desert Traders LLC", "country": "UAE", "interest": ["MAKHANA", "FOX NUT", "DRY FRUITS"], "email": "purchasing@deserttraders.ae", "phone": "+971-50-1234567", "verified": True},
-    {"name": "EuroAgri Imports", "country": "Germany", "interest": ["RICE", "WHEAT", "GRAINS"], "email": "import@euroagri.de", "phone": "+49-30-123456", "verified": False},
-    {"name": "London Asian Foods", "country": "UK", "interest": ["MAKHANA", "TURMERIC", "INDIAN GROCERIES"], "email": "buyer@londonasian.co.uk", "phone": "+44-20-7946", "verified": True},
-    {"name": "Saudi Agro Corp", "country": "Saudi Arabia", "interest": ["RICE", "SPICES"], "email": "info@saudiagro.sa", "phone": "+966-11-456789", "verified": True},
-    {"name": "Sydney Organics", "country": "Australia", "interest": ["TURMERIC", "HONEY", "ORGANIC"], "email": "sourcing@sydneyorganics.com.au", "phone": "+61-2-1234", "verified": False},
-    {"name": "Nippon Traders", "country": "Japan", "interest": ["SESAME", "SPICES"], "email": "import@nippontraders.jp", "phone": "+81-3-1234", "verified": True},
-]
-
-def load_data():
-# ... existing code ...
-        else:
-            time.sleep(2) # Idle state
-
-# Start the background thread immediately
-thread = threading.Thread(target=background_scraper_loop, daemon=True)
-thread.start()
-
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EXIM Lead Discovery Bot</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; }
-        .log-container::-webkit-scrollbar { width: 8px; }
-        .log-container::-webkit-scrollbar-track { background: #1e293b; }
-        .log-container::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        .log-container::-webkit-scrollbar-thumb:hover { background: #64748b; }
         
         .tab-btn { transition: all 0.2s ease-in-out; }
         .tab-active { background-color: #3b82f6; color: white; border-color: #3b82f6; }
@@ -667,56 +214,54 @@ HTML_TEMPLATE = r"""
 </head>
 <body class="bg-slate-900 text-slate-200 min-h-screen flex flex-col">
     
-    <!-- Top Navbar -->
-    <nav class="bg-slate-800 border-b border-slate-700 p-4 sticky top-0 z-10">
+    <nav class="bg-slate-800 border-b border-slate-700 p-4 sticky top-0 z-10 shadow-lg">
         <div class="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-4">
             <div class="flex items-center space-x-3">
-                <div class="bg-blue-500/20 p-2 rounded-lg text-blue-400">
+                <div class="bg-blue-500/20 p-2.5 rounded-lg text-blue-400">
                     <i class="fa-solid fa-ship text-xl"></i>
                 </div>
-                <h1 class="text-xl font-bold text-white tracking-tight">EXIM Lead Notifier</h1>
+                <div>
+                    <h1 class="text-xl font-bold text-white tracking-tight">EXIM Lead Notifier</h1>
+                    <p class="text-xs text-slate-400 font-medium">Automated Buyer Discovery</p>
+                </div>
             </div>
             
-            <!-- Tabs -->
             <div class="flex space-x-2 bg-slate-900/50 p-1 rounded-lg border border-slate-700">
-                <button onclick="switchTab('live')" id="btn-tab-live" class="tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2">
+                <button onclick="switchTab('live')" id="btn-tab-live" class="tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border">
                     <i class="fa-solid fa-satellite-dish"></i> <span>Live Scraper</span>
                 </button>
-                <button onclick="switchTab('directory')" id="btn-tab-directory" class="tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2">
+                <button onclick="switchTab('directory')" id="btn-tab-directory" class="tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-transparent">
                     <i class="fa-solid fa-address-book"></i> <span>Buyer Directory</span>
                 </button>
             </div>
 
             <div class="flex items-center space-x-4 text-sm font-medium">
-                <span id="status-indicator" class="flex items-center space-x-2 bg-slate-700 px-3 py-1.5 rounded-full">
-                    <span class="w-2.5 h-2.5 rounded-full bg-slate-500" id="status-dot"></span>
+                <span id="status-indicator" class="flex items-center space-x-2 bg-slate-700 px-3 py-1.5 rounded-full border border-slate-600 shadow-inner">
+                    <span class="w-2.5 h-2.5 rounded-full bg-slate-400" id="status-dot"></span>
                     <span id="status-text">Stopped</span>
                 </span>
             </div>
         </div>
     </nav>
 
-    <!-- MAIN VIEW: LIVE SCRAPER -->
     <div id="view-live" class="max-w-7xl mx-auto p-4 lg:p-8 w-full grid grid-cols-1 lg:grid-cols-3 gap-8">
         
-        <!-- Left Column: Controls & Config -->
         <div class="space-y-6">
-            
-            <!-- Scraper Control Card -->
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl relative overflow-hidden">
-                <div class="absolute top-0 right-0 p-3 opacity-10">
-                    <i class="fa-solid fa-power-off text-6xl"></i>
+            <!-- Engine Control Card -->
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl relative overflow-hidden group">
+                <div class="absolute top-0 right-0 p-4 opacity-5 transition-opacity group-hover:opacity-10">
+                    <i class="fa-solid fa-microchip text-7xl"></i>
                 </div>
                 <h2 class="text-lg font-semibold text-white mb-4">Engine Control</h2>
-                <div class="flex items-center space-x-4 mb-4">
-                    <button id="btn-start" onclick="toggleEngine('start')" class="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2">
+                <div class="flex items-center space-x-4 mb-4 relative z-10">
+                    <button id="btn-start" onclick="toggleEngine('start')" class="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white py-3 rounded-xl font-bold transition-all shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2">
                         <i class="fa-solid fa-play"></i> <span>Start Bot</span>
                     </button>
-                    <button id="btn-stop" onclick="toggleEngine('stop')" class="flex-1 bg-rose-500 hover:bg-rose-600 text-white py-3 rounded-xl font-semibold transition-all shadow-lg shadow-rose-500/20 opacity-50 cursor-not-allowed flex items-center justify-center space-x-2" disabled>
+                    <button id="btn-stop" onclick="toggleEngine('stop')" class="flex-1 bg-rose-500 hover:bg-rose-600 text-white py-3 rounded-xl font-bold transition-all shadow-lg shadow-rose-500/20 opacity-50 cursor-not-allowed flex items-center justify-center space-x-2" disabled>
                         <i class="fa-solid fa-stop"></i> <span>Stop Bot</span>
                     </button>
                 </div>
-                <p class="text-sm text-slate-400">Last Checked: <span id="last-checked" class="text-slate-300 font-medium">Never</span></p>
+                <p class="text-sm text-slate-400">Last Checked: <span id="last-checked" class="text-slate-200 font-medium bg-slate-900 px-2 py-0.5 rounded">Never</span></p>
             </div>
 
             <!-- Telegram Config Card -->
@@ -727,68 +272,68 @@ HTML_TEMPLATE = r"""
                 </h2>
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Bot Token</label>
-                        <input type="password" id="tg-token" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">Bot Token</label>
+                        <input type="password" id="tg-token" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all placeholder-slate-600" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
                     </div>
                     <div>
-                        <label class="block text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Chat ID</label>
-                        <input type="text" id="tg-chat-id" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all" placeholder="-100123456789">
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1.5">Chat ID</label>
+                        <input type="text" id="tg-chat-id" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all placeholder-slate-600" placeholder="-100123456789">
                     </div>
-                    <button onclick="saveConfig()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2 rounded-lg text-sm font-medium transition-colors">
+                    <button onclick="saveConfig()" class="w-full bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-lg text-sm font-semibold transition-colors">
                         Save Configuration
                     </button>
                 </div>
             </div>
 
             <!-- Live Logs Card -->
-            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl flex flex-col h-[350px]">
+            <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl flex flex-col h-[380px]">
                 <h2 class="text-lg font-semibold text-white mb-4 flex items-center justify-between">
                     <span><i class="fa-solid fa-terminal mr-2 text-slate-400"></i> System Logs</span>
-                    <button onclick="clearLogs()" class="text-xs text-slate-500 hover:text-slate-300"><i class="fa-solid fa-trash"></i></button>
+                    <button onclick="clearLogs()" class="text-xs text-slate-400 hover:text-white px-2 py-1 bg-slate-900 rounded border border-slate-700 transition-colors"><i class="fa-solid fa-trash mr-1"></i> Clear</button>
                 </h2>
-                <div id="logs-container" class="flex-1 bg-slate-900 rounded-xl p-4 overflow-y-auto log-container font-mono text-xs space-y-2 border border-slate-700/50">
+                <div id="logs-container" class="flex-1 bg-slate-900 rounded-xl p-4 overflow-y-auto log-container font-mono text-xs space-y-2 border border-slate-700 shadow-inner">
                     <!-- Logs will be injected here -->
                 </div>
             </div>
         </div>
 
-        <!-- Right Column: Product Management -->
         <div class="lg:col-span-2 space-y-6">
             <div class="bg-slate-800 border border-slate-700 rounded-2xl shadow-xl overflow-hidden flex flex-col h-full">
                 
-                <!-- Add Product Header Form -->
-                <div class="p-6 border-b border-slate-700 bg-slate-800/50">
-                    <h2 class="text-lg font-semibold text-white mb-4">Targeted Products</h2>
+                <div class="p-6 border-b border-slate-700 bg-slate-800/80">
+                    <h2 class="text-lg font-semibold text-white mb-4 flex items-center space-x-2">
+                        <i class="fa-solid fa-crosshairs text-emerald-400"></i>
+                        <span>Targeted Products</span>
+                    </h2>
                     <form id="add-product-form" onsubmit="addProduct(event)" class="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
                         <div class="md:col-span-4">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">Product Name *</label>
-                            <input type="text" id="prod-name" required class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. Makhana, Turmeric">
+                            <label class="block text-xs font-semibold text-slate-400 mb-1.5">Product Name *</label>
+                            <input type="text" id="prod-name" required class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-emerald-500 outline-none placeholder-slate-600" placeholder="e.g. Makhana, Turmeric">
                         </div>
                         <div class="md:col-span-3">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">HS Code (Optional)</label>
-                            <input type="text" id="prod-hs" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. 19041090">
+                            <label class="block text-xs font-semibold text-slate-400 mb-1.5">HS Code (Optional)</label>
+                            <input type="text" id="prod-hs" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-emerald-500 outline-none placeholder-slate-600" placeholder="e.g. 19041090">
                         </div>
                         <div class="md:col-span-3">
-                            <label class="block text-xs font-medium text-slate-400 mb-1">Countries (Comma sep.)</label>
-                            <input type="text" id="prod-countries" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" placeholder="e.g. USA, UAE, UK">
+                            <label class="block text-xs font-semibold text-slate-400 mb-1.5">Countries (Comma sep.)</label>
+                            <input type="text" id="prod-countries" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-emerald-500 outline-none placeholder-slate-600" placeholder="e.g. USA, UAE">
                         </div>
                         <div class="md:col-span-2">
-                            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-2 rounded-lg text-sm font-medium transition-colors h-[38px]">
+                            <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-lg text-sm font-semibold transition-colors shadow-lg shadow-emerald-600/20 h-[42px]">
                                 Add Target
                             </button>
                         </div>
                     </form>
                 </div>
 
-                <!-- Products Table -->
-                <div class="flex-1 overflow-auto bg-slate-900/50">
+                <div class="flex-1 overflow-auto bg-slate-900/50 relative">
                     <table class="w-full text-left text-sm text-slate-300">
-                        <thead class="text-xs uppercase bg-slate-800/80 text-slate-400 sticky top-0">
+                        <thead class="text-xs uppercase bg-slate-800/95 text-slate-400 sticky top-0 border-b border-slate-700 shadow-sm z-10">
                             <tr>
-                                <th class="px-6 py-4 font-medium">Product Name</th>
-                                <th class="px-6 py-4 font-medium">HS Code</th>
-                                <th class="px-6 py-4 font-medium">Target Markets</th>
-                                <th class="px-6 py-4 font-medium text-right">Action</th>
+                                <th class="px-6 py-4 font-semibold">Product Name</th>
+                                <th class="px-6 py-4 font-semibold">HS Code</th>
+                                <th class="px-6 py-4 font-semibold">Target Markets</th>
+                                <th class="px-6 py-4 font-semibold text-right">Action</th>
                             </tr>
                         </thead>
                         <tbody id="products-table-body" class="divide-y divide-slate-700/50">
@@ -796,11 +341,10 @@ HTML_TEMPLATE = r"""
                         </tbody>
                     </table>
                     
-                    <!-- Empty State -->
-                    <div id="empty-state" class="hidden flex flex-col items-center justify-center p-12 text-slate-500">
-                        <i class="fa-solid fa-box-open text-4xl mb-3 opacity-50"></i>
-                        <p>No products targeted yet.</p>
-                        <p class="text-xs mt-1">Add a product above to start monitoring EXIM leads.</p>
+                    <div id="empty-state" class="hidden absolute inset-0 flex flex-col items-center justify-center p-12 text-slate-500 bg-slate-900/50 backdrop-blur-sm z-0">
+                        <i class="fa-solid fa-box-open text-5xl mb-4 opacity-30"></i>
+                        <p class="font-medium text-slate-400">No products targeted yet.</p>
+                        <p class="text-xs mt-1 text-slate-500">Add a product above to start monitoring EXIM leads.</p>
                     </div>
                 </div>
 
@@ -809,14 +353,13 @@ HTML_TEMPLATE = r"""
 
     </div>
 
-    <!-- MAIN VIEW: BUYER DIRECTORY (Hidden by default) -->
     <div id="view-directory" class="max-w-7xl mx-auto p-4 lg:p-8 w-full hidden flex-col flex-1">
-        <div class="flex justify-between items-end mb-6">
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-end mb-8 gap-4">
             <div>
-                <h2 class="text-2xl font-bold text-white mb-1">Global Buyer Database</h2>
-                <p class="text-slate-400 text-sm">Discover existing international buyers matching your targeted products.</p>
+                <h2 class="text-3xl font-bold text-white mb-2 tracking-tight">Global Buyer Database</h2>
+                <p class="text-slate-400 text-sm max-w-xl border-l-2 border-blue-500 pl-3">This directory automatically cross-references your targeted products with our database to surface verified international buyers instantly.</p>
             </div>
-            <button onclick="fetchDirectory()" class="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center space-x-2">
+            <button onclick="fetchDirectory()" class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2.5 rounded-lg text-sm font-semibold transition-colors flex items-center space-x-2 shadow-lg shadow-blue-500/20 whitespace-nowrap">
                 <i class="fa-solid fa-rotate-right"></i> <span>Refresh Matches</span>
             </button>
         </div>
@@ -825,15 +368,15 @@ HTML_TEMPLATE = r"""
             <!-- Directory Cards Injected Here -->
         </div>
         
-        <div id="directory-empty" class="hidden flex flex-col items-center justify-center p-20 bg-slate-800/50 border border-slate-700 rounded-2xl text-slate-500 mt-6">
-            <i class="fa-solid fa-magnifying-glass text-5xl mb-4 opacity-50"></i>
-            <h3 class="text-xl font-medium text-slate-300">No matching buyers found</h3>
-            <p class="mt-2 text-center max-w-md text-sm">We couldn't find any existing buyers in the database for your specific products. Try adding more general targets like "Spices" or "Rice".</p>
+        <div id="directory-empty" class="hidden flex flex-col items-center justify-center p-20 bg-slate-800/50 border border-slate-700 rounded-2xl text-slate-500 mt-6 shadow-inner">
+            <i class="fa-solid fa-magnifying-glass text-6xl mb-6 opacity-20"></i>
+            <h3 class="text-xl font-semibold text-slate-300">No matching buyers found</h3>
+            <p class="mt-2 text-center max-w-md text-sm leading-relaxed">We couldn't find any existing buyers in the database for your specific products. Try adding broader targets like "Spices" or "Rice" to your Live Scraper tab.</p>
+            <button onclick="switchTab('live')" class="mt-6 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm font-medium transition-colors">Go back to setup</button>
         </div>
     </div>
 
     <script>
-        // --- TAB SWITCHING LOGIC ---
         function switchTab(tabId) {
             const btnLive = document.getElementById('btn-tab-live');
             const btnDir = document.getElementById('btn-tab-directory');
@@ -841,24 +384,23 @@ HTML_TEMPLATE = r"""
             const viewDir = document.getElementById('view-directory');
 
             if(tabId === 'live') {
-                btnLive.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border';
+                btnLive.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-blue-500';
                 btnDir.className = 'tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-transparent';
                 viewLive.classList.remove('hidden');
                 viewLive.classList.add('grid');
                 viewDir.classList.add('hidden');
                 viewDir.classList.remove('flex');
             } else {
-                btnDir.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border';
+                btnDir.className = 'tab-btn tab-active px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-blue-500';
                 btnLive.className = 'tab-btn tab-inactive px-4 py-1.5 rounded-md text-sm font-medium flex items-center space-x-2 border border-transparent';
                 viewDir.classList.remove('hidden');
                 viewDir.classList.add('flex');
                 viewLive.classList.add('hidden');
                 viewLive.classList.remove('grid');
-                fetchDirectory(); // Load data when opening tab
+                fetchDirectory(); 
             }
         }
 
-        // --- DIRECTORY LOGIC ---
         async function fetchDirectory() {
             try {
                 const res = await fetch('/api/directory');
@@ -885,41 +427,41 @@ HTML_TEMPLATE = r"""
             grid.classList.remove('hidden');
             
             buyers.forEach(buyer => {
-                const tags = buyer.interest.map(i => `<span class="bg-blue-900/30 text-blue-400 border border-blue-800/50 px-2 py-0.5 rounded text-xs">${i}</span>`).join('');
+                const tags = buyer.interest.map(i => `<span class="bg-blue-500/10 text-blue-400 border border-blue-500/20 px-2.5 py-1 rounded-md text-xs font-medium tracking-wide">${i}</span>`).join('');
                 const badge = buyer.verified 
-                    ? `<span class="flex items-center space-x-1 text-emerald-400 text-xs bg-emerald-400/10 px-2 py-1 rounded-full"><i class="fa-solid fa-circle-check"></i> <span>Verified</span></span>` 
-                    : `<span class="flex items-center space-x-1 text-amber-400 text-xs bg-amber-400/10 px-2 py-1 rounded-full"><i class="fa-solid fa-circle-question"></i> <span>Unverified</span></span>`;
+                    ? `<span class="flex items-center space-x-1.5 text-emerald-400 text-xs font-bold bg-emerald-400/10 px-2.5 py-1 rounded-full"><i class="fa-solid fa-certificate"></i> <span>Verified</span></span>` 
+                    : `<span class="flex items-center space-x-1.5 text-slate-400 text-xs font-bold bg-slate-700/50 px-2.5 py-1 rounded-full"><i class="fa-regular fa-circle-question"></i> <span>Unverified</span></span>`;
                 
                 const card = document.createElement('div');
-                card.className = "bg-slate-800 border border-slate-700 p-5 rounded-xl shadow-lg hover:border-slate-600 transition-colors flex flex-col";
+                card.className = "bg-slate-800 border border-slate-700 p-6 rounded-2xl shadow-xl hover:border-slate-500 hover:shadow-2xl transition-all flex flex-col group";
                 card.innerHTML = `
-                    <div class="flex justify-between items-start mb-4">
+                    <div class="flex justify-between items-start mb-5">
                         <div>
-                            <h3 class="font-bold text-white text-lg">${buyer.name}</h3>
-                            <div class="text-sm text-slate-400 flex items-center space-x-1 mt-1">
-                                <i class="fa-solid fa-location-dot"></i> <span>${buyer.country}</span>
+                            <h3 class="font-bold text-white text-lg group-hover:text-blue-400 transition-colors">${buyer.name}</h3>
+                            <div class="text-sm text-slate-400 flex items-center space-x-1.5 mt-1.5 font-medium">
+                                <i class="fa-solid fa-earth-americas opacity-75"></i> <span>${buyer.country}</span>
                             </div>
                         </div>
                         ${badge}
                     </div>
-                    <div class="mb-4 flex-1">
-                        <p class="text-xs text-slate-500 mb-2 uppercase tracking-wide font-semibold">Interested In:</p>
+                    <div class="mb-6 flex-1">
+                        <p class="text-[11px] text-slate-500 mb-2.5 uppercase tracking-wider font-bold">Import Interests</p>
                         <div class="flex flex-wrap gap-2">
                             ${tags}
                         </div>
                     </div>
-                    <div class="pt-4 border-t border-slate-700 space-y-2">
-                        <a href="mailto:${buyer.email}" class="flex items-center space-x-2 text-sm text-slate-300 hover:text-white transition-colors group">
-                            <div class="w-8 h-8 rounded bg-slate-700 flex items-center justify-center group-hover:bg-blue-600 transition-colors">
+                    <div class="pt-5 border-t border-slate-700 space-y-3">
+                        <a href="mailto:${buyer.email}" class="flex items-center space-x-3 text-sm text-slate-300 hover:text-white transition-colors group/link p-2 -ml-2 rounded-lg hover:bg-slate-700/50">
+                            <div class="w-8 h-8 rounded-lg bg-slate-900 border border-slate-700 flex items-center justify-center group-hover/link:bg-blue-600 group-hover/link:border-blue-500 transition-colors text-slate-400 group-hover/link:text-white shadow-sm">
                                 <i class="fa-solid fa-envelope"></i>
                             </div>
-                            <span>${buyer.email}</span>
+                            <span class="font-medium">${buyer.email}</span>
                         </a>
-                        <div class="flex items-center space-x-2 text-sm text-slate-300 group">
-                            <div class="w-8 h-8 rounded bg-slate-700 flex items-center justify-center">
+                        <div class="flex items-center space-x-3 text-sm text-slate-300 p-2 -ml-2">
+                            <div class="w-8 h-8 rounded-lg bg-slate-900 border border-slate-700 flex items-center justify-center text-slate-400 shadow-sm">
                                 <i class="fa-solid fa-phone"></i>
                             </div>
-                            <span>${buyer.phone}</span>
+                            <span class="font-medium">${buyer.phone}</span>
                         </div>
                     </div>
                 `;
@@ -927,14 +469,164 @@ HTML_TEMPLATE = r"""
             });
         }
 
-        // Fetch Initial State
         async function fetchState() {
-# ... existing code ...
-        // Initialization & Polling
+            try {
+                const res = await fetch('/api/config');
+                const data = await res.json();
+                document.getElementById('tg-token').value = data.tg_token || "";
+                document.getElementById('tg-chat-id').value = data.tg_chat_id || "";
+                renderProducts(data.products || []);
+                
+                const stateRes = await fetch('/api/state');
+                const stateData = await stateRes.json();
+                updateStatusUI(stateData.running, stateData.last_check);
+            } catch (error) {
+                console.error("Error fetching state:", error);
+            }
+        }
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/logs');
+                const logs = await res.json();
+                const container = document.getElementById('logs-container');
+                container.innerHTML = logs.map(l => `<div class="py-1 border-b border-slate-800/50 text-slate-300">${l}</div>`).join('');
+                container.scrollTop = container.scrollHeight;
+            } catch (error) {
+                console.error("Error fetching logs:", error);
+            }
+        }
+
+        async function toggleEngine(action) {
+            const res = await fetch('/api/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({action})
+            });
+            const data = await res.json();
+            updateStatusUI(data.running, data.last_check);
+            fetchLogs();
+        }
+
+        function updateStatusUI(isRunning, lastCheck) {
+            const btnStart = document.getElementById('btn-start');
+            const btnStop = document.getElementById('btn-stop');
+            const statusDot = document.getElementById('status-dot');
+            const statusText = document.getElementById('status-text');
+            const lastCheckText = document.getElementById('last-checked');
+
+            lastCheckText.textContent = lastCheck;
+
+            if (isRunning) {
+                btnStart.classList.add('opacity-50', 'cursor-not-allowed');
+                btnStart.disabled = true;
+                btnStop.classList.remove('opacity-50', 'cursor-not-allowed');
+                btnStop.disabled = false;
+                
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse';
+                statusText.textContent = 'Engine Active';
+                statusText.className = 'text-emerald-400 font-bold';
+            } else {
+                btnStart.classList.remove('opacity-50', 'cursor-not-allowed');
+                btnStart.disabled = false;
+                btnStop.classList.add('opacity-50', 'cursor-not-allowed');
+                btnStop.disabled = true;
+                
+                statusDot.className = 'w-2.5 h-2.5 rounded-full bg-slate-500';
+                statusText.textContent = 'Stopped';
+                statusText.className = 'text-slate-400 font-semibold';
+            }
+        }
+
+        async function saveConfig() {
+            const token = document.getElementById('tg-token').value;
+            const chatId = document.getElementById('tg-chat-id').value;
+            
+            await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tg_token: token, tg_chat_id: chatId})
+            });
+            
+            const btn = document.querySelector('button[onclick="saveConfig()"]');
+            const originalText = btn.textContent;
+            btn.textContent = "Saved Successfully!";
+            btn.classList.add('bg-emerald-600');
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.classList.remove('bg-emerald-600');
+            }, 2000);
+        }
+
+        async function addProduct(e) {
+            e.preventDefault();
+            const name = document.getElementById('prod-name').value;
+            const hs = document.getElementById('prod-hs').value;
+            const countries = document.getElementById('prod-countries').value;
+
+            const res = await fetch('/api/products', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name, hs_code: hs, countries})
+            });
+            
+            const data = await res.json();
+            renderProducts(data.products);
+            document.getElementById('add-product-form').reset();
+        }
+
+        async function removeProduct(index) {
+            const res = await fetch(`/api/products?index=${index}`, { method: 'DELETE' });
+            const data = await res.json();
+            renderProducts(data.products);
+        }
+
+        async function clearLogs() {
+            await fetch('/api/logs', { method: 'DELETE' });
+            fetchLogs();
+        }
+
+        function renderProducts(products) {
+            const tbody = document.getElementById('products-table-body');
+            const emptyState = document.getElementById('empty-state');
+            
+            tbody.innerHTML = '';
+            
+            if (products.length === 0) {
+                emptyState.classList.remove('hidden');
+                return;
+            }
+            
+            emptyState.classList.add('hidden');
+            
+            products.forEach((p, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-slate-800/50 transition-colors group";
+                
+                const cList = p.countries.length > 0 ? p.countries.join(", ") : "Global (All)";
+                const hsDisplay = p.hs_code ? `<span class="bg-slate-800 px-2 py-1 rounded text-xs border border-slate-700 font-mono text-slate-300">${p.hs_code}</span>` : `<span class="text-slate-500 italic text-xs">None</span>`;
+                
+                tr.innerHTML = `
+                    <td class="px-6 py-4 font-semibold text-white">${p.name}</td>
+                    <td class="px-6 py-4">${hsDisplay}</td>
+                    <td class="px-6 py-4">
+                        <span class="text-xs font-medium px-2 py-1 bg-blue-900/20 text-blue-400 rounded-md border border-blue-800/30">
+                            ${cList}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-right">
+                        <button onclick="removeProduct(${idx})" class="text-slate-500 hover:text-rose-400 transition-colors p-2 rounded hover:bg-slate-800">
+                            <i class="fa-solid fa-trash-can"></i>
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
         fetchState();
         fetchLogs();
         
-        // Poll status and logs every 2 seconds
         setInterval(async () => {
             fetchLogs();
             const res = await fetch('/api/state');
@@ -949,31 +641,81 @@ HTML_TEMPLATE = r"""
 
 @app.route("/")
 def index():
-# ... existing code ...
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/api/state", methods=["GET", "POST"])
+def api_state():
+    if request.method == "POST":
+        action = request.json.get("action")
+        if action == "start":
+            STATE["running"] = True
+            add_log("Engine received START command.")
+        elif action == "stop":
+            STATE["running"] = False
+            add_log("Engine received STOP command.")
+    return jsonify(STATE)
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    config = load_data()
+    if request.method == "POST":
+        config["tg_token"] = request.json.get("tg_token", "").strip()
+        config["tg_chat_id"] = request.json.get("tg_chat_id", "").strip()
+        save_data(config)
+        add_log("Telegram configuration saved securely.")
+    return jsonify(config)
+
+@app.route("/api/products", methods=["POST", "DELETE"])
+def api_products():
+    config = load_data()
+    if request.method == "POST":
+        name = request.json.get("name", "").strip()
+        hs = request.json.get("hs_code", "").strip()
+        countries_raw = request.json.get("countries", "")
+        countries = [c.strip() for c in countries_raw.split(",")] if countries_raw.strip() else []
+        
+        if name:
+            config.setdefault("products", []).append({
+                "name": name,
+                "hs_code": hs,
+                "countries": countries
+            })
+            save_data(config)
+            add_log(f"Added new target: {name}")
+
+    elif request.method == "DELETE":
+        idx = int(request.args.get("index", -1))
+        if 0 <= idx < len(config.get("products", [])):
+            removed = config["products"].pop(idx)
+            save_data(config)
+            add_log(f"Removed target: {removed['name']}")
+            
+    return jsonify(config)
+
+@app.route("/api/logs", methods=["GET"])
+def get_logs():
+    return jsonify(LOGS)
+
 @app.route("/api/logs", methods=["DELETE"])
 def delete_logs():
     LOGS.clear()
-    add_log("Logs cleared.")
+    add_log("Logs cleared by user.")
     return jsonify({"status": "ok"})
 
 @app.route("/api/directory", methods=["GET"])
 def get_directory():
-    """Matches configured target products with the mock buyer database."""
     config = load_data()
     target_products = [p["name"].upper() for p in config.get("products", [])]
     
-    # If no targets are set, don't show any buyers
     if not target_products:
         return jsonify([])
         
     matched_buyers = []
     
     for buyer in MOCK_BUYERS_DB:
-        # Check if any of the buyer's interests align with our targeted products
-        # A simple keyword match: if our target word is in their interest list
         buyer_interests = [i.upper() for i in buyer["interest"]]
-        
         is_match = False
+        
         for target in target_products:
             for interest in buyer_interests:
                 if target in interest or interest in target:
@@ -987,7 +729,6 @@ def get_directory():
             
     return jsonify(matched_buyers)
 
-
 if __name__ == "__main__":
-    # Ensure config file exists initially
-# ... existing code ...
+    load_data() 
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
