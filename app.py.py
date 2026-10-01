@@ -26,8 +26,8 @@ def load_data():
         except:
             pass
     return {
-        "telegram_token": "",
-        "telegram_chat_id": "",
+        "telegram_token": "8985436294:AAFmTeHQM2PKVAgKjI_VY--4UJYrndoiBZw",
+        "telegram_chat_id": "2132933443",
         "products": []
     }
 
